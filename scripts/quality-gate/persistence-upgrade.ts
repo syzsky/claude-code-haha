@@ -9,12 +9,21 @@ type Check = {
 const rootDir = process.cwd()
 const checks: Check[] = [
   {
+    title: 'WeChat delivery journal and media preference schema upgrades preserve old fixtures',
+    command: ['bun', 'test', './adapters/wechat/__tests__/delivery-store.test.ts', './adapters/wechat/__tests__/media-preferences.test.ts'],
+  },
+  {
     title: 'Project auxiliary directories and legacy session snapshots',
     command: ['bun', 'test', './src/server/services/sessionService.additionalDirectories.test.ts'],
   },
   {
     title: 'Idle power preferences migrate disabled and preserve the last action record',
     command: ['bun', 'run', 'test', '--', '--run', 'electron/services/idlePowerPersistence.test.ts'],
+    cwd: 'desktop',
+  },
+  {
+    title: 'Desktop native appearance caches preserve old fixtures and both ground preferences',
+    command: ['bun', 'run', 'test', '--', '--run', 'electron/services/nativeAppearance.test.ts'],
     cwd: 'desktop',
   },
   {
@@ -55,6 +64,10 @@ const checks: Check[] = [
   {
     title: 'Agent Teams plan sidecar compatibility and approval recovery',
     command: ['bun', 'test', './src/utils/swarm/teamPlanStore.test.ts', './src/server/services/teamPlanService.test.ts'],
+  },
+  {
+    title: 'Agent Teams incarnation runtime gate migration, original backups and forward fields',
+    command: ['bun', 'test', './src/utils/swarm/teamRuntimeControlStore.test.ts'],
   },
   {
     title: 'Agent Teams legacy mailbox migration to unread inbox plus history',

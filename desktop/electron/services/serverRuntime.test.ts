@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import { PassThrough } from 'node:stream'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SidecarChild, SidecarPlan } from './sidecarManager'
@@ -103,6 +104,35 @@ async function waitForCondition(predicate: () => boolean): Promise<void> {
 }
 
 describe('ElectronServerRuntime', () => {
+  it('restarts only WeChat after invalidating health and waiting for the old worker to exit', async () => {
+    const fetch = vi.fn(async () => Response.json({ ok: true }))
+    const runtime = createRuntime({ fetch: fetch as unknown as typeof globalThis.fetch })
+    await runtime.startServer()
+    const original = [...sidecarMocks.adapterChildren]
+    const wechat = original[2]!
+    const restart = runtime.restartAdaptersSidecars('wechat')
+    expect(runtime.restartAdaptersSidecars('wechat')).toBe(restart)
+    await waitForMockCalls(wechat.kill, 1)
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    wechat.exitCode = 0
+    wechat.emit('exit', 0, null)
+    await restart
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/wechat/runtime/invalidate'), expect.objectContaining({ method: 'POST' }))
+    expect(wechat.kill).toHaveBeenCalledTimes(1)
+    for (const other of original.filter(child => child !== wechat)) expect(other.kill).not.toHaveBeenCalled()
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT + 1)
+    expect(sidecarMocks.spawnSidecar.mock.calls.at(-1)![0].args).toContain('--wechat')
+    runtime.stopAll()
+  })
+
+  it('does not stop any adapter when resetting WeChat health fails', async () => {
+    const runtime = createRuntime({ fetch: (async () => new Response('', { status: 503 })) as typeof fetch })
+    await runtime.startServer()
+    await expect(runtime.restartAdaptersSidecars('wechat')).rejects.toThrow('Unable to reset')
+    for (const child of sidecarMocks.adapterChildren) expect(child.kill).not.toHaveBeenCalled()
+    runtime.stopAll()
+  })
+
   it('drains the authenticated server and every adapter before stopping the server', async () => {
     const order: string[] = []
     const runtime = createRuntime({ fetch: (async (_url, options) => {
@@ -803,6 +833,7 @@ describe('ElectronServerRuntime', () => {
     const runtime = createRuntime()
     await runtime.startServer()
     const firstAdapters = [...sidecarMocks.adapterChildren]
+    for (const child of firstAdapters) child.kill.mockImplementation(() => { child.exitCode = 0; child.emit('exit', 0, null) })
 
     await runtime.restartAdaptersSidecars()
     const restartedAdapters = sidecarMocks.adapterChildren.slice(ADAPTER_COUNT)
@@ -826,6 +857,13 @@ describe('ElectronServerRuntime', () => {
     const secondRestart = runtime.restartAdaptersSidecars()
 
     expect(secondRestart).toBe(firstRestart)
+    await waitForMockCalls(originalAdapters[0]!.kill, 1)
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    for (const child of originalAdapters.slice(0, -1)) { child.exitCode = 0; child.emit('exit', 0, null) }
+    await Promise.resolve()
+    expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT)
+    originalAdapters.at(-1)!.exitCode = 0
+    originalAdapters.at(-1)!.emit('exit', 0, null)
     await Promise.all([firstRestart, secondRestart])
     expect(sidecarMocks.adapterChildren).toHaveLength(ADAPTER_COUNT * 2)
     for (const adapter of originalAdapters) {
@@ -841,6 +879,7 @@ describe('ElectronServerRuntime', () => {
     await runtime.startServer()
     const firstServer = sidecarMocks.serverChildren[0]!
     const originalAdapters = [...sidecarMocks.adapterChildren]
+    for (const child of originalAdapters) child.kill.mockImplementation(() => { child.exitCode = 0; child.emit('exit', 0, null) })
     sidecarMocks.onAdapterSpawn = () => {
       sidecarMocks.onAdapterSpawn = null
       firstServer.emit('exit', 23, null)
@@ -905,5 +944,27 @@ describe('ElectronServerRuntime', () => {
       '/isolated/user-data/diagnostics/electron-host.log',
       expect.stringContaining('[process-error] sidecar process error: spawn error'),
     )
+  })
+
+  it('persists the system proxy resolver failure behind a Cloudflare CONNECT 502', async () => {
+    const runtime = createRuntime({ diagnosticsFile: '/isolated/diagnostics/electron-host.log',
+      resolveSystemProxy: async () => { throw Object.assign(new Error('PAC resolver failed token=fixture-private-pac'), { code: 'EAI_AGAIN' }) },
+    })
+    try {
+      await runtime.startServer()
+      const bridge = new URL(sidecarMocks.serverPlans.at(-1)!.env.CC_HAHA_SYSTEM_PROXY_URL!)
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const request = http.request({ hostname: bridge.hostname, port: Number(bridge.port), method: 'CONNECT', path: 'region1.v2.argotunnel.com:7844' })
+        request.once('connect', (response, socket) => { socket.destroy(); resolve(response.statusCode) })
+        request.once('error', reject)
+        request.end()
+      })
+      expect(status).toBe(502)
+      const logs = sidecarMocks.appendHostDiagnostic.mock.calls.map(call => String(call[1])).join('\n')
+      expect(logs).toContain('system_proxy_resolution')
+      expect(logs).toContain('PAC resolver failed')
+      expect(logs).toContain('EAI_AGAIN')
+      expect(logs).not.toContain('fixture-private-pac')
+    } finally { runtime.stopAll() }
   })
 })

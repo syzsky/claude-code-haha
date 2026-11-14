@@ -67,6 +67,8 @@ export type AppliedAppearance = {
    * repaint when it next starts in the morning.
    */
   lightBackground: string
+  /** Dark preference, even when the currently applied theme is light. Older hosts may omit it. */
+  darkBackground?: string
   /** Whether the renderer is tracking the OS setting rather than a fixed pick. */
   followSystem: boolean
 }
@@ -590,7 +592,7 @@ export type DesktopHost = {
     }
   }
   adapters: {
-    restartSidecar(): Promise<void>
+    restartSidecar(target?: 'wechat'): Promise<void>
   }
   zoom: {
     set(level: number): Promise<void>

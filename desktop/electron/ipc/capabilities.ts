@@ -305,13 +305,15 @@ const workspaceBrowserMessage: Validator = value =>
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/
 const appliedAppearance: Validator = value =>
   isRecord(value)
-  && hasOnlyKeys(value, ['isDark', 'background', 'lightBackground', 'followSystem'])
+  && hasOnlyKeys(value, ['isDark', 'background', 'lightBackground', 'darkBackground', 'followSystem'])
   && typeof value.isDark === 'boolean'
   && typeof value.followSystem === 'boolean'
   && typeof value.background === 'string'
   && HEX_COLOR.test(value.background)
   && typeof value.lightBackground === 'string'
   && HEX_COLOR.test(value.lightBackground)
+  && (value.darkBackground === undefined
+    || (typeof value.darkBackground === 'string' && HEX_COLOR.test(value.darkBackground)))
 
 const updateCheckOptions: Validator = value => {
   if (value === undefined) return true
@@ -421,7 +423,7 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.migrationStart]: migrationIdentity,
   [ELECTRON_IPC_CHANNELS.migrationStatus]: noPayload,
   [ELECTRON_IPC_CHANNELS.migrationCancel]: migrationIdentity,
-  [ELECTRON_IPC_CHANNELS.adaptersRestartSidecar]: noPayload,
+  [ELECTRON_IPC_CHANNELS.adaptersRestartSidecar]: value => value === undefined || (isRecord(value) && hasOnlyKeys(value, ['target']) && value.target === 'wechat'),
   [ELECTRON_IPC_CHANNELS.zoomSet]: zoomPayload,
   [ELECTRON_IPC_CHANNELS.appearanceSetApplied]: appliedAppearance,
 } satisfies Record<ElectronIpcChannel, Validator>

@@ -30,6 +30,7 @@ import { computerUseApprovalService } from '../services/computerUseApprovalServi
 import { sessionService } from '../services/sessionService.js'
 import { observeSessionTurns, type SessionTurnEvent } from '../services/sessionTurnEvents.js'
 import * as titleService from '../services/titleService.js'
+import * as teamRuntime from '../services/teamPlanRuntime.js'
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
 import * as sideChatRegistry from '../services/sideChatRegistry.js'
@@ -75,6 +76,77 @@ function makeSdkSocket(sessionId: string, sdkToken: string) {
   } as unknown as ServerWebSocket<WebSocketData>
 }
 
+describe('Agent Teams Stop ownership without a leader process', () => {
+  afterEach(() => {
+    __resetWebSocketHandlerStateForTests()
+    resetSettingsCache()
+    mock.restore()
+  })
+
+  for (const stopWhileRestoring of [false, true]) {
+    it(`waits for the acknowledged team roster before a user frame (${stopWhileRestoring ? 'Stop wins' : 'deliver'})`, async () => {
+      const sessionId = `team-first-frame-${crypto.randomUUID()}`
+      const ws = makeClientSocket(sessionId)
+      let release!: () => void
+      const restored = new Promise<void>(resolve => { release = resolve })
+      const readiness = spyOn(teamRuntime, 'waitForTeamRuntimeLeadReady').mockImplementation(() => restored)
+      spyOn(teamRuntime, 'noteLeadUserMessage').mockResolvedValue()
+      spyOn(conversationService, 'hasSession').mockReturnValue(true)
+      spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+      spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+      spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+      spyOn(conversationService, 'sendInterrupt').mockReturnValue(false)
+      spyOn(conversationService, 'requestControl').mockResolvedValue({})
+      spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+      const committed: string[] = []
+      spyOn(conversationService, 'sendMessage').mockImplementation(async (_id, content, _attachments, options) => {
+        if (options?.canSend && !options.canSend()) return false
+        committed.push(String(content))
+        options?.onCommitted?.()
+        return true
+      })
+      try {
+        handleWebSocket.open(ws)
+        handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Continue the original team' }))
+        await flushMicrotasks(60)
+        expect(readiness).toHaveBeenCalledWith(sessionId)
+        expect(committed).toEqual([])
+        if (stopWhileRestoring) handleWebSocket.message(ws, JSON.stringify({ type: 'stop_generation' }))
+        release()
+        await flushMicrotasks(120)
+        expect(committed).toEqual(stopWhileRestoring ? [] : ['Continue the original team'])
+      } finally {
+        release()
+        await flushMicrotasks(30)
+      }
+    })
+  }
+
+  for (const starting of [false, true]) {
+    it(`interrupts the team when its leader ${starting ? 'is still starting' : 'has exited'}`, async () => {
+      const sessionId = `team-stop-without-lead-${crypto.randomUUID()}`
+      const ws = makeClientSocket(sessionId)
+      spyOn(conversationService, 'hasSession').mockReturnValue(false)
+      const interrupt = spyOn(conversationService, 'sendInterrupt').mockReturnValue(false)
+      let release: (() => void) | undefined
+      if (starting) {
+        const startup = new Promise<void>(resolve => { release = resolve })
+        __registerPendingSessionStartupForTests(sessionId, startup)
+      }
+      try {
+        handleWebSocket.message(ws, JSON.stringify({ type: 'stop_generation' }))
+        await flushMicrotasks()
+        // The runtime owns independent workers even when no lead SDK channel
+        // exists. Stop must reach that owner before displaying an idle turn.
+        expect(interrupt).toHaveBeenCalledWith(sessionId)
+      } finally {
+        release?.()
+        await flushMicrotasks()
+      }
+    })
+  }
+})
+
 function mockSavedDeepSeekProvider(): void {
   spyOn(ProviderService.prototype, 'listProviders').mockResolvedValue({
     activeId: 'deepseek',
@@ -100,6 +172,142 @@ function mockSavedDeepSeekProvider(): void {
 async function flushMicrotasks(count = 12): Promise<void> {
   for (let index = 0; index < count; index++) await Promise.resolve()
 }
+
+describe('WebSocket ordered attachment admission', () => {
+  afterEach(() => {
+    __resetWebSocketHandlerStateForTests()
+    resetSettingsCache()
+    mock.restore()
+  })
+
+  for (const pendingStage of ['startup', 'attachment materialization'] as const) {
+    it(`preserves a video and following text while ${pendingStage} is pending`, async () => {
+      const sessionId = `wechat-video-admission-${crypto.randomUUID()}`
+      const ws = makeClientSocket(sessionId)
+      let release!: () => void
+      const pending = new Promise<void>(resolve => { release = resolve })
+      let runtimeReady = pendingStage !== 'startup'
+      if (!runtimeReady) __registerPendingSessionStartupForTests(sessionId, pending.then(() => { runtimeReady = true }))
+      spyOn(conversationService, 'hasSession').mockImplementation(() => runtimeReady)
+      spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+      spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+      spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+      spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+      const committed: Array<{ content: string; attachments: unknown }> = []
+      const send = spyOn(conversationService, 'sendMessage').mockImplementation(async (_id, content, attachments, options) => {
+        if (attachments && pendingStage === 'attachment materialization') await pending
+        if (options?.canSend && !options.canSend()) return false
+        committed.push({ content, attachments })
+        options?.onCommitted?.()
+        return true
+      })
+      const attachments = [{ type: 'file', name: 'phone.mp4', path: '/tmp/phone.mp4', mimeType: 'video/mp4' }]
+      handleWebSocket.open(ws)
+      handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Uploaded video', attachments }))
+      await flushMicrotasks(40)
+      handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Extract audio from the video above' }))
+      await flushMicrotasks(40)
+      expect(committed).toEqual([])
+      release()
+      await flushMicrotasks(100)
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(committed).toEqual([
+        { content: 'Uploaded video', attachments },
+        { content: 'Extract audio from the video above', attachments: undefined },
+      ])
+    })
+  }
+
+  it('discards queued attachment follow-ups on Stop and allows a new input', async () => {
+    const sessionId = `wechat-video-stop-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    let release!: () => void
+    let runtimeReady = false
+    const pending = new Promise<void>(resolve => { release = () => { runtimeReady = true; resolve() } })
+    __registerPendingSessionStartupForTests(sessionId, pending)
+    spyOn(conversationService, 'hasSession').mockImplementation(() => runtimeReady)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(conversationService, 'sendInterrupt').mockReturnValue(true)
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+    const send = spyOn(conversationService, 'sendMessage').mockResolvedValue(true)
+    handleWebSocket.open(ws)
+    handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Uploaded video' }))
+    await flushMicrotasks(30)
+    handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Discard this queued follow-up' }))
+    handleWebSocket.message(ws, JSON.stringify({ type: 'stop_generation' }))
+    release()
+    await flushMicrotasks(60)
+    expect(send).not.toHaveBeenCalled()
+    handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Fresh request after Stop' }))
+    await flushMicrotasks(100)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0]?.[1]).toBe('Fresh request after Stop')
+  })
+
+  it('cancels queued admissions on session cleanup without blocking a replacement connection', async () => {
+    const sessionId = `wechat-video-cleanup-${crypto.randomUUID()}`
+    const previous = makeClientSocket(sessionId)
+    const replacement = makeClientSocket(sessionId)
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+    const committed: string[] = []
+    const send = spyOn(conversationService, 'sendMessage').mockImplementation(async (_id, content, _attachments, options) => {
+      if (content === 'Old video') await pending
+      if (options?.canSend && !options.canSend()) return false
+      committed.push(content)
+      options?.onCommitted?.()
+      return true
+    })
+    handleWebSocket.open(previous)
+    handleWebSocket.message(previous, JSON.stringify({ type: 'user_message', content: 'Old video' }))
+    await flushMicrotasks(40)
+    handleWebSocket.message(previous, JSON.stringify({ type: 'user_message', content: 'Old follow-up' }))
+    expect(closeSessionConnection(sessionId)).toBe(true)
+    handleWebSocket.open(replacement)
+    handleWebSocket.message(replacement, JSON.stringify({ type: 'user_message', content: 'New request' }))
+    await flushMicrotasks(100)
+    expect(committed).toEqual(['New request'])
+    release()
+    await flushMicrotasks(100)
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(committed).toEqual(['New request'])
+  })
+
+  it('does not block a different session behind video admission', async () => {
+    const waitingId = `wechat-video-waiting-${crypto.randomUUID()}`
+    const otherId = `wechat-video-independent-${crypto.randomUUID()}`
+    const waiting = makeClientSocket(waitingId)
+    const other = makeClientSocket(otherId)
+    let release!: () => void
+    let runtimeReady = false
+    const pending = new Promise<void>(resolve => { release = () => { runtimeReady = true; resolve() } })
+    __registerPendingSessionStartupForTests(waitingId, pending)
+    spyOn(conversationService, 'hasSession').mockImplementation(id => id !== waitingId || runtimeReady)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+    const send = spyOn(conversationService, 'sendMessage').mockResolvedValue(true)
+    handleWebSocket.open(waiting)
+    handleWebSocket.open(other)
+    handleWebSocket.message(waiting, JSON.stringify({ type: 'user_message', content: 'Pending video' }))
+    handleWebSocket.message(waiting, JSON.stringify({ type: 'user_message', content: 'Follow-up' }))
+    handleWebSocket.message(other, JSON.stringify({ type: 'user_message', content: 'Independent message' }))
+    await flushMicrotasks(100)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0]?.[0]).toBe(otherId)
+    release()
+    await flushMicrotasks(100)
+    expect(send.mock.calls.map(call => call[1])).toEqual(['Independent message', 'Pending video', 'Follow-up'])
+  })
+})
 
 describe('WebSocket Grok catalog runtime selection', () => {
   afterEach(() => {
@@ -5656,7 +5864,7 @@ describe('WebSocket handler session isolation', () => {
     expect(ws.sent.map(payload => JSON.parse(payload)).filter(message => message.type === 'error')).toEqual([])
   })
 
-  it('does not let an older failed handler clear a newer active turn', async () => {
+  it('advances admission after an older failure without clearing the queued newer turn', async () => {
     const sessionId = `concurrent-user-message-${crypto.randomUUID()}`
     const ws = makeClientSocket(sessionId)
     spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
@@ -5690,10 +5898,11 @@ describe('WebSocket handler session isolation', () => {
       content: 'newer turn',
     }))
     await new Promise((resolve) => setTimeout(resolve, 0))
-    expect(customTitleCalls).toBe(2)
+    expect(customTitleCalls).toBe(1)
 
     rejectFirst(new Error('older metadata request failed'))
     await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(customTitleCalls).toBe(2)
 
     ws.sent.length = 0
     handleWebSocket.message(ws, JSON.stringify({ type: 'sync_state' }))

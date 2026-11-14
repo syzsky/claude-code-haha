@@ -49,6 +49,7 @@ import {
   type ImageDimensions,
   ImageResizeError,
   maybeResizeAndDownsampleImageBuffer,
+  optimizeImageForContext,
 } from '../../utils/imageResizer.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { logError } from '../../utils/log.js'
@@ -842,6 +843,7 @@ async function callInner(
 }> {
   // --- Notebook ---
   if (ext === 'ipynb') {
+    const beforeRead = await getFsImplementation().stat(resolvedFilePath)
     const cells = await readNotebook(resolvedFilePath)
     const cellsJson = jsonStringify(cells)
 
@@ -859,8 +861,13 @@ async function callInner(
 
     await validateContentTokens(cellsJson, ext, maxTokens)
 
-    // Get mtime via async stat (single call, no prior existence check)
     const stats = await getFsImplementation().stat(resolvedFilePath)
+    // The edit guard must describe the bytes returned to the model. A stat
+    // acquired only after Read could authorize unseen concurrent changes.
+    if (stats.mtimeMs !== beforeRead.mtimeMs || stats.size !== beforeRead.size || stats.ino !== beforeRead.ino) {
+      readFileState.delete(fullFilePath)
+      throw new Error('Notebook changed while reading. Read it again before editing.')
+    }
     readFileState.set(fullFilePath, {
       content: cellsJson,
       timestamp: Math.floor(stats.mtimeMs),
@@ -1156,7 +1163,7 @@ export async function readImageWithTokenBudget(
   // Try standard resize
   let result: ImageResult
   try {
-    const resized = await maybeResizeAndDownsampleImageBuffer(
+    const resized = await optimizeImageForContext(
       imageBuffer,
       originalSize,
       detectedFormat,
